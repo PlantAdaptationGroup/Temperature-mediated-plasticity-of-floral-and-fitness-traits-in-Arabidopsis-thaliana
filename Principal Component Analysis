@@ -1,0 +1,230 @@
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(factoextra)
+library(openxlsx)
+library(ggrepel)
+library(ggforce)
+library(svglite)
+library(grid)
+library(gridExtra)
+
+
+# === USER INPUTS ===
+file_path <- 
+output_folder <- 
+dir.create(output_folder, showWarnings = FALSE, recursive = TRUE)
+temps <- c("Temp17", "Temp20", "Temp24", "Temp27")
+
+selected_traits <- c("days_to_bolting",
+                     "days_to_10_siliques",
+                     "FD",
+                     "seeds_per_silique",
+                     "single_seed_weight_mg",
+                     "Number_of_seeds_Total",
+                     "number_of_flowers")
+
+# === 1. COMBINED PCA ===
+data_all <- lapply(temps, function(sheet) {
+  df <- read_excel(file_path, sheet = sheet)
+  df <- df %>% drop_na()
+  df$Temperature <- sheet
+  df
+}) %>% bind_rows()
+
+
+meta_all <- data_all[, c("#pot", "Accession", "Temperature")]
+
+traits_all <- data_all %>% 
+  select(all_of(selected_traits)) %>% 
+  select(where(is.numeric))
+
+traits_all <- traits_all[, apply(traits_all, 2, function(x) sd(x) > 0)]
+rownames(traits_all) <- paste(meta_all$Accession, meta_all$Temperature, meta_all$`#pot`, sep = "_")
+
+pca_all <- prcomp(traits_all, scale. = TRUE)
+
+scores_all <- as.data.frame(pca_all$x)
+scores_all$Accession <- meta_all$Accession
+scores_all$Temperature <- meta_all$Temperature
+loadings <- as.data.frame(pca_all$rotation)
+loadings$Trait <- rownames(loadings)
+
+# Rename traits for plotting
+loadings$Trait <- recode(loadings$Trait,
+                         "days_to_bolting" = "FT (days)",
+                         "days_to_10_siliques" = "ESDT (days)",
+                         "FD" = "FD [mm]",
+                         "seeds_per_silique" = "SS",
+                         "single_seed_weight_mg" = "SSW [mg]",
+                         "Number_of_seeds_Total" = "SN",
+                         "number_of_flowers" = "FN"
+)
+
+
+temp_colors <- c("Temp17" = "blue", "Temp20" = "green", "Temp24" = "orange", "Temp27" = "red")
+alpha_value <- 0.1
+
+scores_all_with_iqr <- scores_all %>%
+  group_by(Temperature) %>%
+  mutate(
+    pc1_iqr_lower = quantile(PC1, 0.25) - 1.5 * IQR(PC1),
+    pc1_iqr_upper = quantile(PC1, 0.75) + 1.5 * IQR(PC1),
+    pc2_iqr_lower = quantile(PC2, 0.25) - 1.5 * IQR(PC2),
+    pc2_iqr_upper = quantile(PC2, 0.75) + 1.5 * IQR(PC2)
+  ) %>%
+  ungroup()
+
+# Manually assign glyphs to accessions
+accession_glyph_map <- c(
+  "Aitba-2" = "●",
+  "Ba-1" = "○",
+  "Bozen-1.2" = "▲",
+  "Bsch-0" = "△",
+  "Castelfed-4-213" = "■",
+  "Cdm-0" = "□",
+  "CIBC-5" = "◆",
+  "DraII-6" = "◇",
+  "DraIV 1-8" = "✖",
+  "DraIV 3-7" = "✚",
+  "DraIV 5-12" = "✦",
+  "Hovdala-2" = "✪",
+  "Lag1-2" = "★",
+  "Lag1-6" = "☆",
+  "Le-0" = "✿",
+  "Ler-0" = "❖",
+  "Lis-1" = "⬢",
+  "LL-0" = "⬡",
+  "Mer-6" = "⬟",
+  "Mitterberg-1-181" = "⬠",
+  "Or-0" = "◉",
+  "Qui-0" = "◍",
+  "Rue3-1-31" = "◔",
+  "Se-0" = "◑",
+  "Sij-2" = "◐",
+  "Tha-1" = "◒",
+  "Ts-1" = "◓",
+  "TueSB30-3" = "◕",
+  "Tu-KS-7" = "✤",
+  "UKSW06-226" = "✥",
+  "UKSW06-257" = "❉",
+  "Wt-5" = "✸",
+  "Xan-1" = "✷",
+  "Wa-1" = "✹"
+)
+
+
+# Add glyph column to scores_all_with_iqr
+scores_all_with_iqr$Glyph <- accession_glyph_map[scores_all_with_iqr$Accession]
+
+# Create a custom legend for glyphs
+custom_legend <- guide_legend(
+  title = "Accession",
+  override.aes = list(shape = accession_glyph_map)
+)
+
+plot_all <- ggplot(scores_all_with_iqr, aes(x = PC1, y = PC2)) +
+  # Plot the glyphs without adding to the legend
+  geom_text(aes(label = Glyph, size = Temperature), fontface = "bold", show.legend = FALSE) +
+  
+  # Dummy points to create proper size + fill legend
+  geom_point(
+    data = distinct(scores_all_with_iqr, Temperature), 
+    aes(x = Inf, y = Inf, size = Temperature, fill = Temperature), 
+    shape = 21, color = "black", stroke = 0.5
+  ) +
+  
+  scale_size_manual(
+    name = "Temperature",
+    values = c("Temp17" = 3, "Temp20" = 4, "Temp24" = 5, "Temp27" = 6),
+    labels = c("Temp17" = "17°C", "Temp20" = "20°C", "Temp24" = "24°C", "Temp27" = "27°C"),
+    guide = guide_legend(override.aes = list(shape = 21))
+  ) +
+  
+  scale_fill_manual(
+    name = "Temperature",
+    values = temp_colors,
+    labels = c("Temp17" = "17°C", "Temp20" = "20°C", "Temp24" = "24°C", "Temp27" = "27°C")
+  ) +
+  
+  geom_mark_ellipse(
+    data = scores_all_with_iqr %>%
+      filter(PC1 >= pc1_iqr_lower & PC1 <= pc1_iqr_upper & PC2 >= pc2_iqr_lower & PC2 <= pc2_iqr_upper),
+    aes(group = Temperature, fill = Temperature),
+    alpha = alpha_value,
+    color = "black", size = 1
+  ) +
+  
+  scale_color_manual(
+    values = temp_colors,
+    labels = c("Temp17" = "17°C", "Temp20" = "20°C", "Temp24" = "24°C", "Temp27" = "27°C")
+  ) +
+  
+  geom_segment(data = loadings,
+               aes(x = 0, y = 0, xend = PC1 * 5, yend = PC2 * 5),
+               arrow = arrow(length = unit(0.3, "cm")),
+               color = "gray10", size = 1.1, inherit.aes = FALSE) +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed", size = 0.8) +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed", size = 0.8) +
+  
+  geom_text_repel(data = loadings,
+                  aes(x = PC1 * 5, y = PC2 * 5, label = Trait),
+                  fontface = "bold", size = 4.5, color = "black", inherit.aes = FALSE) +
+  
+  labs(
+    x = paste0("PC1 (", round(summary(pca_all)$importance[2,1] * 100, 1), "%)"),
+    y = paste0("PC2 (", round(summary(pca_all)$importance[2,2] * 100, 1), "%)")
+  ) +
+  coord_cartesian(
+    xlim = range(scores_all_with_iqr$PC1) * 1.1,
+    ylim = range(scores_all_with_iqr$PC2) * 1.1,
+    clip = "off"  # Allow drawing outside the panel
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(size = 18, face = "bold"),
+    axis.title = element_text(size = 20, face = "bold"),
+    axis.text = element_text(size = 20,  face = "bold"),
+    legend.title = element_text(size = 20, face = "bold"),
+    legend.text = element_text(size = 20, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.key.size = unit(1.5, "lines")  # Increase key (box) size
+  )
+
+
+# Save the plot
+ggsave(filename = file.path(output_folder, "PCA.svg"),
+       plot = plot_all, width = 18, height = 12)
+
+# Create a dataframe for legend
+legend_df <- data.frame(
+  Accession = names(accession_glyph_map),
+  Glyph = unname(accession_glyph_map)
+)
+
+# Create the table grob
+legend_grob <- tableGrob(legend_df, rows = NULL)
+
+# Save legend separately or combine it
+ggsave(file.path(output_folder, "glyph_legend.svg"), legend_grob, width = 4, height = nrow(legend_df) * 0.3, dpi = 600)
+
+# Add #pot to scores_all_with_iqr first (if it's not already there)
+scores_all_with_iqr$Pot <- meta_all$`#pot`
+
+# Identify outliers based on PC1 and PC2 IQR thresholds
+outliers <- scores_all_with_iqr %>%
+  filter(
+    PC1 < pc1_iqr_lower | PC1 > pc1_iqr_upper |
+      PC2 < pc2_iqr_lower | PC2 > pc2_iqr_upper
+  ) %>%
+  select(Pot, Accession, Temperature, PC1, PC2, Glyph)
+
+# View or save
+print(outliers)
+
+# Optional: Save to file
+write.csv(outliers, file.path(output_folder, "PCA.csv"), row.names = FALSE)
+
+
