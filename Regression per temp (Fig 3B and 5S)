@@ -1,0 +1,166 @@
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(broom)
+library(RColorBrewer)
+
+trait_file <- "FILE PATH TRAITS"
+plasticity_file <- "FILE PATH PLASTICITY"
+output_folder <- "FILE PATH"
+if (!dir.exists(output_folder)) dir.create(output_folder, recursive = TRUE)
+
+temp_sheets <- c("Temp17", "Temp20", "Temp24", "Temp27")
+plasticity_sheets <- c("Plasticity_17_20", "Plasticity_20_24", "Plasticity_24_27", "Plasticity_17_27")
+
+fitness_traits <- c("single_seed_weight_mg", "Number_of_seeds_Total", "number_of_flowers", "seeds_per_silique")
+nonfitness_traits <- c("days_to_bolting", "days_to_10_siliques", "FD")
+
+average_replicates <- function(df, accession_col = "Accession", trait_cols) {
+  df %>%
+    mutate(across(all_of(accession_col), as.character)) %>%
+    group_by(across(all_of(accession_col))) %>%
+    summarise(across(all_of(trait_cols), mean, na.rm = TRUE), .groups = "drop") %>%
+    rename(accession = !!accession_col)
+}
+
+plasticity_list <- lapply(plasticity_sheets, function(sheet) {
+  df <- read_excel(plasticity_file, sheet = sheet)
+  df <- df %>%
+    mutate(accession = as.character(Accession))
+  df
+})
+names(plasticity_list) <- plasticity_sheets
+
+nonfitness_list <- lapply(temp_sheets, function(sheet) {
+  df <- read_excel(trait_file, sheet = sheet)
+  df <- df %>% mutate(accession = as.character(Accession))
+  average_replicates(df, accession_col = "Accession", trait_cols = nonfitness_traits)
+})
+names(nonfitness_list) <- temp_sheets
+
+plasticity_full <- plasticity_list %>%
+  purrr::imap_dfc(function(df, name) {
+    df <- df %>% rename_with(~ paste0(.x, "_", name), .cols = fitness_traits)
+    df
+  }) %>%
+  bind_cols() %>%
+  dplyr::select(accession = 1, matches("_Plasticity_")) %>%
+  mutate(accession = as.character(accession))
+
+results <- list()
+
+for (pred_temp in temp_sheets) {
+  
+  predictors <- nonfitness_list[[pred_temp]] %>%
+    rename_with(~ paste0(.x, "_trait"), .cols = nonfitness_traits)
+  
+  df_joined <- inner_join(predictors, plasticity_full, by = "accession") %>%
+    drop_na()
+  
+  predictor_cols <- paste0(nonfitness_traits, "_trait")
+  
+  response_cols <- setdiff(colnames(plasticity_full), "accession")
+  
+  for (resp in response_cols) {
+    formula <- as.formula(paste(resp, "~", paste(predictor_cols, collapse = " + ")))
+    
+    fit <- lm(formula, data = df_joined)
+    
+    coef_df <- broom::tidy(fit) %>%
+      mutate(response = resp, predictor_temp = pred_temp)
+    
+    r2 <- summary(fit)$r.squared
+    r2_df <- tibble(term = "R_squared", estimate = r2,
+                    response = resp, predictor_temp = pred_temp)
+    
+    results[[length(results) + 1]] <- list(coef = coef_df, r2 = r2_df)
+  }
+}
+
+coef_all <- bind_rows(lapply(results, `[[`, "coef"))
+r2_all <- bind_rows(lapply(results, `[[`, "r2"))
+
+writexl::write_xlsx(
+  list(Coefficients = coef_all, R2 = r2_all),
+  file.path(output_folder, "regression_results_nonfitness_predict_plasticity.xlsx")
+)
+
+combined_colors <- c(brewer.pal(8, "Set2"), brewer.pal(8, "Dark2"))
+
+r2_all_clean <- r2_all %>%
+  mutate(plasticity_trait = response,
+         temp_group = gsub(".*Plasticity_", "", plasticity_trait),
+         response_trait = sub("_Plasticity_.*", "", plasticity_trait))
+
+ggplot(r2_all_clean, aes(x = predictor_temp, y = estimate, fill = plasticity_trait)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(
+    data = r2_all_clean %>% filter(estimate > 0.3),
+    aes(label = sprintf("%.2f", estimate)),
+    position = position_dodge(width = 0.8),
+    vjust = -0.5,
+    size = 4,
+    color = "black",
+    fontface = "bold"
+  ) +
+  labs(
+    title = "Response of plasticities to non-fitness traits combined for a tested temperature",
+    x = "Non-fitness predictors",
+    y = expression(R^2),
+    fill = "Plasticity Response"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(size = 14, face = "bold"),
+    axis.text.y = element_text(size = 14, face = "bold"),
+    axis.title.x = element_text(margin = margin(t = 10)),
+    axis.title.y = element_text(margin = margin(r = 10)),
+    axis.line = element_line(color = "black"),
+    legend.position = "bottom",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  scale_fill_manual(values = combined_colors) +
+  geom_hline(yintercept = 0.3, color = "red", linetype = "dotted", linewidth = 1)
+
+
+ggsave(file.path(output_folder, "r2_barplot_nonfitness_predict_plasticity.svg"),
+       width = 15, height = 8, dpi = 300)
+
+
+coef_summary <- coef_all %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    plasticity_trait = response,
+    predictor_temp = factor(predictor_temp, levels = temp_sheets)
+  ) %>%
+  group_by(plasticity_trait, predictor_temp) %>%
+  summarise(
+    avg_coef = mean(estimate),
+    avg_abs_coef = mean(abs(estimate)),
+    .groups = "drop"
+  )
+
+ggplot(coef_summary, aes(x = predictor_temp, y = avg_coef, fill = plasticity_trait)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  labs(
+    title = "Average coefficient (across predictors) per plasticity trait and temperature",
+    x = "Predictor Temperature",
+    y = "Average Coefficient Estimate",
+    fill = "Plasticity Trait"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(size = 14, face = "bold"),
+    axis.text.y = element_text(size = 14),
+    legend.position = "bottom"
+  ) +
+  scale_fill_manual(values = combined_colors) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40")
+
+ggsave(file.path(output_folder, "coefficients_barplot_nonfitness_predict_plasticity_facet.svg"),
+       width = 15, height = 12, dpi = 300)
