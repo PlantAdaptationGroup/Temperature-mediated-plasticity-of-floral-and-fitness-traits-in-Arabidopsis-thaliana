@@ -1,0 +1,420 @@
+library(readxl)
+library(ggplot2)
+library(tidyr)
+library(RColorBrewer)
+library(openxlsx)
+library(cluster)
+library(pheatmap)
+library(readr)
+library(factoextra)
+library(scales)
+library(openxlsx)
+library(rstatix)
+library(patchwork)
+library(htmlwidgets)
+library(leaflet)
+library(htmltools)
+library(cluster)
+library(tibble)
+library(geosphere)
+library(dplyr)
+library(viridis)
+
+output_folder <- "FILE PATH"
+dir.create(output_folder, showWarnings = FALSE)
+
+file_path <- "FILE PATH"
+sheet_names <- c("Temp17", "Temp20", "Temp24", "Temp27")
+
+data_list <- lapply(sheet_names, function(sheet) {
+  read_excel(file_path, sheet = sheet) %>%
+    mutate(Temperature = sheet)
+})
+data_combined <- bind_rows(data_list)
+
+data_combined$Accession <- factor(data_combined$Accession)
+data_combined$Temperature <- factor(data_combined$Temperature, levels = sheet_names)
+
+variables_to_plot <- c("FD", 
+                       "days_to_bolting", 
+                       "days_to_10_siliques", 
+                       "seeds_per_silique",
+                       "single_seed_weight_mg",
+                       "Number_of_seeds_Total",
+                       "number_of_flowers")
+
+pretty_names <- c(
+  FD = "FD [mm]",
+  days_to_bolting = "FT (days)",
+  days_to_10_siliques = "ESDT (days)",
+  seeds_per_silique = "SS",
+  single_seed_weight_mg = "SSW [mg]",
+  Number_of_seeds_Total = "SN",
+  number_of_flowers = "FN"
+)
+
+temp_labels <- c("17°C", "20°C", "24°C", "27°C")
+names(temp_labels) <- sheet_names
+
+cluster_file <- file.path(output_folder, "Cluster_memberships.xlsx")
+cluster_info <- list()
+
+silhouette_scores_list <- list()
+
+silhouette_plot_folder <- file.path(output_folder, "Silhouette_Plots")
+dir.create(silhouette_plot_folder, showWarnings = FALSE)
+
+distance_matrices_list <- list()
+
+wb <- createWorkbook()
+
+all_cluster_plots <- list()
+class(data_combined)
+
+for (var in variables_to_plot) {
+  if (!(var %in% colnames(data_combined))) {
+    message(paste("Skipping", var, "- not found"))
+    next
+  }
+  
+  df_var <- data_combined %>%
+    dplyr::select(Accession, Temperature, !!sym(var)) %>%
+    filter(!is.na(.data[[var]])) %>%
+    group_by(Accession, Temperature) %>%
+    summarise(value = mean(.data[[var]], na.rm = TRUE), .groups = "drop")
+  
+  df_wide <- df_var %>%
+    pivot_wider(names_from = Temperature, values_from = value) %>%
+    drop_na()
+  
+  if (nrow(df_wide) < 3) next  # skip if too few
+    
+  df_raw <- data_combined %>%
+    dplyr::select(Accession, Temperature, !!sym(var)) %>%
+    filter(!is.na(.data[[var]]))
+  
+  temp_pairs <- list(
+    c("Temp17", "Temp20"),
+    c("Temp20", "Temp24"),
+    c("Temp24", "Temp27")
+  )
+  
+  change_matrix <- matrix(NA, nrow = length(unique(df_raw$Accession)), ncol = length(temp_pairs),
+                          dimnames = list(unique(df_raw$Accession), 
+                                          paste0("Change_", sapply(temp_pairs, function(x) paste0(x[1], "_vs_", x[2])))))
+  
+  for (acc in unique(df_raw$Accession)) {
+    df_acc <- df_raw %>% filter(Accession == acc)
+    
+    for (i in seq_along(temp_pairs)) {
+      t1 <- temp_pairs[[i]][1]
+      t2 <- temp_pairs[[i]][2]
+      
+      values_t1 <- df_acc %>% filter(Temperature == t1) %>% pull(!!sym(var))
+      values_t2 <- df_acc %>% filter(Temperature == t2) %>% pull(!!sym(var))
+      
+      if (length(values_t1) > 1 & length(values_t2) > 1) {
+        test_res <- try(wilcox.test(values_t1, values_t2, paired = FALSE, exact = FALSE), silent = TRUE)
+        if (inherits(test_res, "try-error")) {
+          change_matrix[acc, i] <- NA
+        } else {
+          p_val <- test_res$p.value
+          median_diff <- median(values_t2) - median(values_t1)
+          if (p_val < 0.05) {
+            change_matrix[acc, i] <- ifelse(median_diff > 0, 1, -1)
+          } else {
+            change_matrix[acc, i] <- 0
+          }
+        }
+      } else {
+        # If insufficient replicates, encode no change (or NA)
+        change_matrix[acc, i] <- NA
+      }
+    }
+  }
+  change_matrix <- change_matrix[rowSums(is.na(change_matrix)) == 0, ]
+  
+  distance_matrix <- as.matrix(dist(change_matrix, method = "euclidean"))
+  write.csv(distance_matrix, file = file.path(output_folder, paste0("Euclidean distance matrix", " ", pretty_names[[var]], ".csv")), row.names = TRUE)
+  
+  max_k <- floor(nrow(change_matrix) / 2)
+  
+  best_models <- list()
+  silhouette_scores <- numeric(length = max_k - 1) 
+  
+  for (k in 2:max_k) {
+    best_sil <- -Inf
+    best_result <- NULL
+    
+    for (i in 1:10) {
+      set.seed(i) 
+      result <- tryCatch(kmeans(change_matrix, centers = k, iter.max = 10000), error = function(e) NULL)
+      if (!is.null(result)) {
+        sil <- silhouette(result$cluster, dist(change_matrix))
+        avg_sil <- mean(sil[, 3])
+        if (avg_sil > best_sil) {
+          best_sil <- avg_sil
+          best_result <- result
+        }
+      }
+    }
+    
+    silhouette_scores[k - 1] <- best_sil
+    best_models[[as.character(k)]] <- best_result
+  }
+  
+  d1 <- diff(silhouette_scores)
+  
+  gain_threshold <- 0.05 
+  
+  plateau_candidates <- which(d1 < gain_threshold)
+  
+  if (length(plateau_candidates) > 0) {
+    selected_index <- plateau_candidates[1]
+  } else {
+    selected_index <- which.max(silhouette_scores)
+  }
+  
+  optimal_k <- selected_index + 1
+  
+  final_result <- best_models[[as.character(optimal_k)]]
+  cluster_assignments <- final_result$cluster
+  
+  silhouette_plot <- data.frame(k = 2:max_k, SilhouetteScore = silhouette_scores)
+  silhouette_ggplot <- ggplot(silhouette_plot, aes(x = k, y = SilhouetteScore)) +
+    geom_line(color = "steelblue", size = 1) +
+    geom_point(size = 2) +
+    geom_vline(xintercept = optimal_k, linetype = "dashed", color = "red") +
+    ggtitle(pretty_names[[var]]) +  # Use the variable name in the title
+    xlab("Number of Clusters (k)") +
+    ylab("Silhouette Score") +
+    theme_minimal(base_size = 14) +  # Base font size for all text
+    theme(
+      plot.title = element_text(size = 18, face = "bold"),
+      axis.title = element_text(size = 18),
+      axis.text = element_text(size = 18)
+    )
+  
+  ggsave(filename = file.path(output_folder, paste0(pretty_names[[var]], " ", "silhouette plot.svg")),
+         plot = silhouette_ggplot, width = 4, height = 4)
+  
+  df_wide <- df_wide %>% filter(Accession %in% names(cluster_assignments))
+
+  df_wide$Cluster <- factor(cluster_assignments[match(df_wide$Accession, names(cluster_assignments))])
+
+  df_long <- df_wide %>%
+    pivot_longer(cols = all_of(sheet_names), names_to = "Temperature", values_to = "value") %>%
+    mutate(Temperature = factor(Temperature, levels = sheet_names),
+           Cluster = factor(Cluster))
+
+  cluster_summary <- df_long %>%
+    group_by(Cluster, Temperature) %>%
+    summarise(
+      Mean = mean(value, na.rm = TRUE),
+      SD = sd(value, na.rm = TRUE),
+      N = n(),
+      Min = min(value, na.rm = TRUE),
+      Max = max(value, na.rm = TRUE),
+      .groups = "drop"
+    )
+  cluster_info[[paste0(pretty_names[[var]], "_summary")]] <- cluster_summary
+
+  cluster_counts <- df_wide %>%
+    group_by(Cluster) %>%
+    summarise(n = n(), .groups = "drop")
+  
+  df_long$Cluster <- as.integer(as.character(df_long$Cluster))
+  cluster_counts$Cluster <- as.integer(cluster_counts$Cluster)
+  
+  df_long <- df_long %>%
+    left_join(cluster_counts, by = "Cluster") %>%
+    mutate(ClusterLabel = paste0("Cluster ", Cluster, " (n=", n, ")"))
+  
+  cluster_stats <- df_long %>%
+    group_by(ClusterLabel, Temperature) %>%
+    summarise(
+      mean_value = mean(value, na.rm = TRUE),
+      se_value = sd(value, na.rm = TRUE) / sqrt(n()),
+      min_value = min(value, na.rm = TRUE),
+      max_value = max(value, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  actual_clusters <- unique(cluster_stats$ClusterLabel)
+  cluster_colors <- viridis(length(actual_clusters), option = "E")
+  names(cluster_colors) <- actual_clusters
+  
+  directionality_df <- as.data.frame(change_matrix)
+  directionality_df$Accession <- rownames(directionality_df)
+  directionality_df$Cluster <- cluster_assignments[match(directionality_df$Accession, names(cluster_assignments))]
+  
+  directionality_df <- directionality_df %>%
+    dplyr::select(Accession, Cluster, everything())
+  
+  write.csv(directionality_df,
+            file = file.path(output_folder, paste0("Cluster fold changes", " ", pretty_names[[var]], ".csv")),
+            row.names = FALSE)
+  
+  sheet_name <- substr(paste0(pretty_names[[var]], "_directionality"), 1, 31)
+  
+  addWorksheet(wb, sheetName = sheet_name)
+  writeData(wb, sheet = sheet_name, directionality_df)
+  
+  cluster_label_map <- setNames(
+    gsub("^Cluster\\s*", "C", unique(cluster_stats$ClusterLabel)),
+    unique(cluster_stats$ClusterLabel)
+  )
+
+  p <- ggplot(cluster_stats, aes(x = Temperature, y = mean_value, color = ClusterLabel, group = ClusterLabel)) +
+    geom_line(linewidth = 2) +  # Increased line width
+    geom_point(size = 5) +      # Increased point size
+    geom_ribbon(aes(ymin = mean_value - se_value, ymax = mean_value + se_value, fill = ClusterLabel),
+                alpha = 0.2, color = NA) +
+    scale_x_discrete(labels = temp_labels) +
+    scale_color_manual(values = cluster_colors, labels = cluster_label_map) +
+    scale_fill_manual(values = cluster_colors, labels = cluster_label_map) +
+    labs(
+      title = pretty_names[[var]],
+      x = "",
+      y = ""
+    ) +
+    theme_minimal(base_size = 14) +  # Bumps overall base size
+    theme(
+      legend.title = element_blank(),
+      plot.title = element_text(size = 18, face = "bold"),
+      axis.title.x = element_text(size = 18, face = "bold"),
+      axis.title.y = element_text(size = 18, face = "bold"),
+      axis.text.x = element_text(size = 18, face = "bold"),
+      axis.text.y = element_text(size = 18, face = "bold"),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.text = element_text(size = 18, face = "bold"),
+      legend.key.size = unit(1.5, "lines"),  # optional: increases spacing around legend items
+      axis.line = element_line(color = "black", linewidth = 1)
+    )
+  
+  
+  all_cluster_plots[[var]] <- p
+  
+  
+  ggsave(file.path(output_folder, paste0("Clusters ", pretty_names[[var]], ".svg")),
+         p, width = 7, height = 4)
+  
+  all_y_vals <- c(
+    cluster_stats$mean_value - cluster_stats$se_value,
+    cluster_stats$mean_value + cluster_stats$se_value,
+    cluster_stats$min_value,
+    cluster_stats$max_value
+  )
+  
+  min_y <- min(all_y_vals, na.rm = TRUE)
+  max_y <- max(all_y_vals, na.rm = TRUE)
+  padding <- 0.05 * (max_y - min_y)
+  
+  ylim_final <- c(min_y - padding, max_y + padding)
+  
+  
+  trait_output_folder <- file.path(output_folder, pretty_names[[var]])
+  if (!dir.exists(trait_output_folder)) dir.create(trait_output_folder, recursive = TRUE)
+  
+  for (clust in unique(cluster_stats$ClusterLabel)) {
+    p_single <- cluster_stats %>%
+      filter(ClusterLabel == clust) %>%
+      ggplot(aes(x = Temperature, y = mean_value, group = 1)) +
+      geom_line(color = cluster_colors[clust], size = 5) +
+      geom_point(color = cluster_colors[clust], size = 8) +
+      geom_ribbon(aes(ymin = mean_value - se_value, ymax = mean_value + se_value),
+                  fill = alpha(cluster_colors[clust], 0.2), color = NA) +
+      scale_x_discrete(labels = temp_labels) +
+      coord_cartesian(ylim = ylim_final) +
+      theme_void(base_size = 14) +  # removes axes, ticks, and background
+      theme(
+        plot.background = element_rect(fill = "white", color = NA),
+        panel.background = element_rect(fill = "white", color = NA),
+        legend.position = "none"
+      )
+    
+    ggsave(filename = file.path(trait_output_folder, paste0("Cluster_", clust, pretty_names[[var]], ".svg")),
+           plot = p_single, width = 8, height = 6)
+  }
+  
+  message("Cluster ", clust, ": max y = ", max(cluster_stats$mean_value[cluster_stats$ClusterLabel == clust], na.rm = TRUE))
+  
+  addWorksheet(wb, sheetName = paste0(pretty_names[[var]], "_wide"))
+  writeData(wb, sheet = paste0(pretty_names[[var]], "_wide"), df_wide)
+  
+  addWorksheet(wb, sheetName = paste0(pretty_names[[var]], "_long"))
+  writeData(wb, sheet = paste0(pretty_names[[var]], "_long"), df_long)
+  
+  cluster_membership <- df_wide %>%
+    dplyr::select(Accession, Cluster) %>%
+    arrange(Cluster)
+  cluster_info[[var]] <- cluster_membership
+  
+  if (!exists("accession_coords")) {
+    coords_file <- "//ad.helsinki.fi/home/j/janhoff/Desktop/Fitness/new/Fitness new measurments full dataset/accession_locations.xlsx"  # Adjust path!
+    accession_coords <- read_excel(coords_file) %>%
+      rename(Accession = Name)  # Rename for easier join
+  }
+  
+  cluster_coords <- data.frame(
+    Accession = names(cluster_assignments),
+    Cluster = cluster_assignments
+  ) %>%
+    mutate(Cluster = factor(Cluster)) %>%
+    left_join(accession_coords, by = "Accession") %>%
+    drop_na(Longitude, Latitude)
+  
+  cluster_colors_map <- hue_pal()(length(unique(cluster_coords$Cluster)))
+  names(cluster_colors_map) <- levels(cluster_coords$Cluster)
+  cluster_coords$color <- cluster_colors_map[as.character(cluster_coords$Cluster)]
+  
+  world_map <- map_data("world")
+  
+  cluster_plot <- ggplot() +
+    geom_polygon(data = world_map, aes(x = long, y = lat, group = group),
+                 fill = "gray95", color = "white", size = 0.2) +
+    geom_jitter(
+      data = cluster_coords,
+      aes(x = Longitude, y = Latitude, color = Cluster),
+      size = 2.5, alpha = 0.9,
+      position = position_jitter(width = 0.66, height = 0.66, seed = 42)  # Set a fixed seed
+    ) +
+    scale_color_manual(values = cluster_colors_map) +
+    theme_minimal(base_size = 12) +
+    coord_cartesian(xlim = c(-15, 70), ylim = c(30, 60), clip = "off") +  # Zooming into desired area
+    labs(
+      title = paste(pretty_names[[var]]),
+      color = "Cluster"
+    ) +
+    theme(
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),  
+      panel.background = element_blank(),  
+      axis.text = element_blank(),
+      axis.title = element_blank(),  
+      axis.ticks = element_blank(),  
+      plot.title = element_blank(),  
+      legend.position = "none"  
+    )
+  
+  output_file <- file.path(output_folder, paste0("Map ", pretty_names[[var]], ".svg"))
+  ggsave(output_file, cluster_plot, width = 8, height = 3, dpi = 300)
+}
+
+combined_plot <- wrap_plots(all_cluster_plots, ncol = 3)
+
+ggsave(file.path(output_folder, "Clusters.svg"),
+       plot = combined_plot, width = 20, height = 10,
+       device = "svg")
+
+cluster_info_shortened <- list()
+for (sheet_name in names(cluster_info)) {
+  short_name <- ifelse(nchar(sheet_name) > 31, substr(sheet_name, 1, 31), sheet_name)
+  cluster_info_shortened[[short_name]] <- cluster_info[[sheet_name]]
+}
+write.xlsx(cluster_info_shortened, cluster_file)
+
+excel_output_path <- file.path(output_folder, "Wide_and_Long_Data.xlsx")
+saveWorkbook(wb, excel_output_path, overwrite = TRUE)
+message("Excel file with wide and long data saved to ", excel_output_path)
