@@ -1,0 +1,151 @@
+library(readxl)
+library(geosphere)
+library(vegan)
+library(tidyverse)
+library(ggpubr)
+
+trait_dist_file <- "FILE PATH EUCLIDEA DISTANCES CALCULATED FROM CUSTOM MATRIX (see cluster script)"
+location_file <- "FILE PATH LOCATION DATA OF ACCESSIONS"
+output_folder <- "FILE PATH"
+
+if (!dir.exists(output_folder)) dir.create(output_folder, recursive = TRUE)
+
+loc_data <- read_excel(location_file)
+names(loc_data) <- trimws(names(loc_data))  # Clean column names
+
+sheet_names <- excel_sheets(trait_dist_file)
+
+trait_names <- c(
+  "FT (days)" = "FT (days)",
+  "ESDT (days)" = "ESDT (days)",
+  "FD" = "FD [mm]",
+  "SS" = "SS",
+  "SSW" = "SSW [mg]",
+  "SN" = "SN",
+  "FN" = "FN"
+)
+
+mantel_plots_all <- list()
+lat_plots_all <- list()
+
+for (trait in sheet_names) {
+  cat("/nProcessing trait:", trait, "/n")
+  
+  pretty_trait <- trait_names[[trait]] %||% trait  # fallback to original if not found
+  
+  trait_folder <- file.path(output_folder, trait)
+  if (!dir.exists(trait_folder)) dir.create(trait_folder)
+  
+  trait_dist <- read_excel(trait_dist_file, sheet = trait)
+  trait_dist <- column_to_rownames(trait_dist, var = names(trait_dist)[1])
+  trait_dist <- as.matrix(trait_dist)
+  
+  accessions <- intersect(rownames(trait_dist), loc_data$Name)
+  trait_dist <- trait_dist[accessions, accessions]
+  loc_data_filtered <- loc_data %>% filter(Name %in% accessions)
+  
+  if (length(accessions) < 3) {
+    warning(paste("Skipping", trait, "– fewer than 3 accessions with matching data."))
+    next
+  }
+  
+  coords <- loc_data_filtered %>% arrange(match(Name, accessions)) %>%
+    dplyr::select(Longitude, Latitude) %>% as.matrix()
+  geo_dist <- distm(coords, fun = distHaversine) / 1000  # km
+  rownames(geo_dist) <- accessions
+  colnames(geo_dist) <- accessions
+  
+  mantel_geo_res <- mantel(trait_dist, geo_dist, method = "spearman", permutations = 10000)
+  cat("Mantel r (geo):", round(mantel_geo_res$statistic, 3), "| p-value:", mantel_geo_res$signif, "/n")
+  
+  trait_vec <- as.vector(trait_dist[lower.tri(trait_dist)])
+  geo_vec <- as.vector(geo_dist[lower.tri(geo_dist)])
+  
+  df_mantel <- data.frame(
+    GeoDistance = geo_vec,
+    TraitDistance = trait_vec
+  )
+  
+  mantel_plot <- ggscatter(
+    data = df_mantel,
+    x = "GeoDistance", y = "TraitDistance",
+    add = "reg.line",
+    conf.int = TRUE
+  ) +
+    labs(
+      x = "Geographic Distance (km)",
+      y = "Trait Distance",
+      title = paste(pretty_trait, "\nr =", round(mantel_geo_res$statistic, 3),
+                    ", p =", signif(mantel_geo_res$signif, 3))
+  ) +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      axis.title = element_text(size = 14, face = "bold"),
+      axis.text = element_text(size = 14, face = "bold")
+    )
+  
+  ggsave(file.path(trait_folder, paste0("mantel_plot_", pretty_trait, ".svg")), mantel_plot, width = 3.5, height = 3)
+  
+  latitudes <- loc_data_filtered$Latitude[match(accessions, loc_data_filtered$Name)]
+  lat_diff_matrix <- abs(outer(latitudes, latitudes, "-"))
+  rownames(lat_diff_matrix) <- accessions
+  colnames(lat_diff_matrix) <- accessions
+  
+  mantel_lat_res <- mantel(trait_dist, lat_diff_matrix, method = "spearman", permutations = 10000)
+  cat("Mantel r (latitude):", round(mantel_lat_res$statistic, 3), "| p-value:", mantel_lat_res$signif, "/n")
+  
+  lat_vec <- as.vector(lat_diff_matrix[lower.tri(lat_diff_matrix)])
+  
+  df_lat <- data.frame(
+    LatitudeDifference = lat_vec,
+    TraitDistance = trait_vec
+  )
+  
+  lat_plot <- ggscatter(
+    data = df_lat,
+    x = "LatitudeDifference", y = "TraitDistance",
+    add = "reg.line",
+    conf.int = TRUE
+  ) +
+    labs(
+      x = "Latitude Difference (°)",
+      y = "Trait Distance",
+      title = paste(pretty_trait, "\nr =", round(mantel_lat_res$statistic, 3),
+                    ", p =", signif(mantel_lat_res$signif, 3))
+  ) +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      axis.title = element_text(size = 14, face = "bold"),
+      axis.text = element_text(size = 14, face = "bold")
+    )
+    
+  
+  ggsave(file.path(trait_folder, paste0("latitude_plot_", pretty_trait, ".svg")), lat_plot, width = 3.5, height = 3)
+  
+  mantel_plots_all[[pretty_trait]] <- mantel_plot
+  lat_plots_all[[pretty_trait]] <- lat_plot
+  
+  mantel_summary <- paste(
+    "Trait:", pretty_trait,
+    "/nMantel r (geo):", round(mantel_geo_res$statistic, 3),
+    "/nP-value (geo):", mantel_geo_res$signif,
+    "/nMantel r (latitude):", round(mantel_lat_res$statistic, 3),
+    "/nP-value (latitude):", mantel_lat_res$signif
+  )
+  writeLines(mantel_summary, file.path(trait_folder, paste0("mantel_result_", trait, ".txt")))
+}
+
+mantel_combined <- ggarrange(
+  plotlist = mantel_plots_all,
+  ncol = 3, nrow = ceiling(length(mantel_plots_all) / 3)
+)
+ggsave(file.path(output_folder, "Geographic Distance plots.svg"),
+       mantel_combined, width = 10, height = 10)
+
+lat_combined <- ggarrange(
+  plotlist = lat_plots_all,
+  ncol = 3, nrow = ceiling(length(lat_plots_all) / 3)
+)
+ggsave(file.path(output_folder, "Latitude plots.svg"),
+       lat_combined, width = 10, height = 10)
+
