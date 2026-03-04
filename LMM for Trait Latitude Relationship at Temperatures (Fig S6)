@@ -12,7 +12,6 @@ library(grid)
 library(cowplot)
 library(patchwork)
 
-# ---- USER INPUT ----
 trait_data_file <- "FILE PATH TRAITS"
 location_file <- "FILE PATH LOCATION DATA OF ACCESSIONS"
 output_folder <- "FILE PATH"
