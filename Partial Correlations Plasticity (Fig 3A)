@@ -1,0 +1,166 @@
+library(readxl)
+library(ppcor)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(patchwork)
+library(stringr)
+library(scales)
+
+output_folder <- "FILE PATH"
+dir.create(output_folder, showWarnings = FALSE)
+
+file_path <- "FILE PATH"
+sheet_names <- c("Plasticity_17_20", "Plasticity_20_24", "Plasticity_24_27", "Plasticity_17_27")
+
+data_list <- lapply(sheet_names, function(sheet) {
+  read_excel(file_path, sheet = sheet) %>%
+    mutate(Temperature = sheet)
+})
+data_combined <- bind_rows(data_list)
+
+data_combined$Accession <- factor(data_combined$Accession)
+data_combined$Temperature <- factor(data_combined$Temperature, levels = sheet_names)
+
+variables_to_use <- c("days_to_bolting", 
+                      "days_to_10_siliques", 
+                      "FD",
+                      "seeds_per_silique",
+                      "single_seed_weight_mg",
+                      "Number_of_seeds_Total",
+                      "number_of_flowers")
+
+pretty_names <- c(
+  days_to_bolting = "FT (days)",
+  days_to_10_siliques = "ESDT (days)",
+  FD = "FD [mm]",
+  seeds_per_silique = "SS",
+  single_seed_weight_mg = "SSW [mg]",
+  Number_of_seeds_Total = "SN",
+  number_of_flowers = "FN"
+)
+
+compute_partial_corr_permutation <- function(df, num_permutations = 10000) {
+  df <- df %>% dplyr::select(all_of(variables_to_use)) %>% tidyr::drop_na()
+  n_vars <- length(variables_to_use)
+  results_list <- list()
+  
+  pcor_result <- pcor(df, method = "spearman")
+  partial_corr_matrix <- pcor_result$estimate
+  
+  for (i in 1:(n_vars - 1)) {
+    for (j in (i + 1):n_vars) {
+      rho <- partial_corr_matrix[i, j]
+      
+      permuted_rhos <- numeric(num_permutations)
+      for (k in 1:num_permutations) {
+        permuted_df <- df
+        permuted_df[[variables_to_use[i]]] <- sample(df[[variables_to_use[i]]])
+        permuted_pcor <- pcor(permuted_df, method = "spearman")
+        permuted_rhos[k] <- permuted_pcor$estimate[i, j]
+      }
+      
+      if (rho >= 0) {
+        p_val <- sum(permuted_rhos >= rho) / num_permutations
+      } else {
+        p_val <- sum(permuted_rhos <= rho) / num_permutations
+      }
+      
+      results_list[[length(results_list) + 1]] <- data.frame(
+        Var1 = variables_to_use[i],
+        Var2 = variables_to_use[j],
+        Rho = rho,
+        P_value = p_val
+      )
+      results_list[[length(results_list) + 1]] <- data.frame(
+        Var1 = variables_to_use[j],
+        Var2 = variables_to_use[i],
+        Rho = rho,
+        P_value = p_val
+      )
+    }
+  }
+  
+  for (i in 1:n_vars) {
+    results_list[[length(results_list) + 1]] <- data.frame(
+      Var1 = variables_to_use[i],
+      Var2 = variables_to_use[i],
+      Rho = 1,
+      P_value = 0
+    )
+  }
+  
+  results_df <- bind_rows(results_list)
+  
+  results_df$Var1 <- factor(results_df$Var1, levels = variables_to_use)
+  results_df$Var2 <- factor(results_df$Var2, levels = variables_to_use)
+  
+  results_df$P_adj <- p.adjust(results_df$P_value, method = "BH")
+  
+  results_df$Significance <- cut(results_df$P_adj,
+                                 breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+                                 labels = c("***", "**", "*", ""))
+  
+  results_df$Label <- ifelse(results_df$P_adj <= 0.05,
+                             sprintf("%.2f\n%s", results_df$Rho, results_df$Significance),
+                             "")
+  
+  results_df$Var1_pretty <- pretty_names[as.character(results_df$Var1)]
+  results_df$Var2_pretty <- pretty_names[as.character(results_df$Var2)]
+  
+  results_df$Var1_pretty <- factor(results_df$Var1_pretty, levels = pretty_names)
+  results_df$Var2_pretty <- factor(results_df$Var2_pretty, levels = pretty_names)
+  
+  return(results_df)
+}
+
+
+heatmaps_per_temp <- list()
+
+for (i in seq_along(sheet_names)) {
+  temp <- sheet_names[i]
+  temp_data <- data_combined %>% filter(Temperature == temp)
+  temp_results <- compute_partial_corr_permutation(temp_data)
+  
+  temp_results <- temp_results %>%
+    filter(as.numeric(Var1) >= as.numeric(Var2))
+  
+  title_pretty <- gsub("Plasticity_", "", temp)
+  title_pretty <- gsub("_", " → ", title_pretty)
+  title_pretty <- paste0(title_pretty, "°C")
+  
+  p <- ggplot(temp_results, aes(x = Var2_pretty, y = Var1_pretty, fill = Rho)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = Label), size = 5, fontface = "bold") +
+    scale_fill_gradient2(
+      low = muted("blue"), mid = "white", high = muted("red"), midpoint = 0,
+      limits = c(-1, 1),
+      guide = guide_colourbar(barwidth = 20)
+    ) +
+    theme_minimal(base_size = 18) +
+    theme(
+      panel.grid = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 18, face = "bold"),
+      axis.text.y = element_text(size = 18, face = "bold"),
+      axis.title = element_blank(),
+      plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+      legend.text = element_text(size = 18, face = "bold"),
+      legend.title = element_text(size = 18, face = "bold")
+    ) +
+    labs(title = title_pretty, fill = expression(rho))
+  
+  if (i != 1) {
+    p <- p + theme(
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank()
+    )
+  }
+  
+  heatmaps_per_temp[[temp]] <- p
+}
+
+combined_plot <- wrap_plots(heatmaps_per_temp, nrow = 1, guides = "collect") & 
+  theme(legend.position = "bottom")
+
+ggsave(file.path(output_folder, "plasticity_correlation_shuffle_both.svg"),
+       combined_plot, width = 25, height = 8, dpi = 300)
