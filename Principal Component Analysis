@@ -11,9 +11,8 @@ library(grid)
 library(gridExtra)
 
 
-# === USER INPUTS ===
-file_path <- 
-output_folder <- 
+file_path <- FILE PATH
+output_folder <- FILE PATH
 dir.create(output_folder, showWarnings = FALSE, recursive = TRUE)
 temps <- c("Temp17", "Temp20", "Temp24", "Temp27")
 
@@ -25,7 +24,6 @@ selected_traits <- c("days_to_bolting",
                      "Number_of_seeds_Total",
                      "number_of_flowers")
 
-# === 1. COMBINED PCA ===
 data_all <- lapply(temps, function(sheet) {
   df <- read_excel(file_path, sheet = sheet)
   df <- df %>% drop_na()
@@ -51,7 +49,6 @@ scores_all$Temperature <- meta_all$Temperature
 loadings <- as.data.frame(pca_all$rotation)
 loadings$Trait <- rownames(loadings)
 
-# Rename traits for plotting
 loadings$Trait <- recode(loadings$Trait,
                          "days_to_bolting" = "FT (days)",
                          "days_to_10_siliques" = "ESDT (days)",
@@ -76,7 +73,6 @@ scores_all_with_iqr <- scores_all %>%
   ) %>%
   ungroup()
 
-# Manually assign glyphs to accessions
 accession_glyph_map <- c(
   "Aitba-2" = "●",
   "Ba-1" = "○",
@@ -115,10 +111,8 @@ accession_glyph_map <- c(
 )
 
 
-# Add glyph column to scores_all_with_iqr
 scores_all_with_iqr$Glyph <- accession_glyph_map[scores_all_with_iqr$Accession]
 
-# Create a custom legend for glyphs
 custom_legend <- guide_legend(
   title = "Accession",
   override.aes = list(shape = accession_glyph_map)
@@ -194,26 +188,21 @@ plot_all <- ggplot(scores_all_with_iqr, aes(x = PC1, y = PC2)) +
   )
 
 
-# Save the plot
 ggsave(filename = file.path(output_folder, "PCA.svg"),
        plot = plot_all, width = 18, height = 12)
 
-# Create a dataframe for legend
+
 legend_df <- data.frame(
   Accession = names(accession_glyph_map),
   Glyph = unname(accession_glyph_map)
 )
 
-# Create the table grob
 legend_grob <- tableGrob(legend_df, rows = NULL)
 
-# Save legend separately or combine it
 ggsave(file.path(output_folder, "glyph_legend.svg"), legend_grob, width = 4, height = nrow(legend_df) * 0.3, dpi = 600)
 
-# Add #pot to scores_all_with_iqr first (if it's not already there)
 scores_all_with_iqr$Pot <- meta_all$`#pot`
 
-# Identify outliers based on PC1 and PC2 IQR thresholds
 outliers <- scores_all_with_iqr %>%
   filter(
     PC1 < pc1_iqr_lower | PC1 > pc1_iqr_upper |
@@ -221,10 +210,8 @@ outliers <- scores_all_with_iqr %>%
   ) %>%
   select(Pot, Accession, Temperature, PC1, PC2, Glyph)
 
-# View or save
 print(outliers)
 
-# Optional: Save to file
 write.csv(outliers, file.path(output_folder, "PCA.csv"), row.names = FALSE)
 
 
