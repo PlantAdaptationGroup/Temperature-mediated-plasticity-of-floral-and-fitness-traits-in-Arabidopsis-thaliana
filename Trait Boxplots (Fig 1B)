@@ -1,0 +1,241 @@
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(multcompView)
+library(ggpubr)
+library(patchwork)
+library(stats)
+library(car)
+library(FSA)             
+library(multcompView)    
+library(writexl)
+
+
+file_path <- FILE PATH
+
+sheets <- c("Temp17", "Temp20", "Temp24", "Temp27")
+
+trait_names <- c("days_to_bolting", "days_to_10_siliques", "FD",
+                 "seeds_per_silique", "single_seed_weight_mg",
+                 "Number_of_seeds_Total", "number_of_flowers")
+trait_labels <- c("FT (days)", "ESDT (days)", "FD [mm]", "SS", "SSW [mg]", "SN", "FN")
+names(trait_labels) <- trait_names
+
+data_all <- lapply(sheets, function(sheet) {
+  df <- read_excel(file_path, sheet = sheet)
+  df$Temperature <- sheet
+  df
+}) %>% bind_rows()
+
+temp_labels <- c("Temp17" = "17°C", "Temp20" = "20°C", "Temp24" = "24°C", "Temp27" = "27°C")
+
+data_all$Temperature <- factor(data_all$Temperature, levels = names(temp_labels),
+                               labels = temp_labels)
+
+mean_list <- list()
+
+plot_trait <- function(trait_name) {
+
+  
+  df_trait <- data_all %>% select(all_of(trait_name), Temperature)
+  colnames(df_trait)[1] <- "value"
+  df_trait <- df_trait %>% filter(!is.na(value))
+  
+  
+  sample_sizes <- df_trait %>% 
+    group_by(Temperature) %>% 
+    summarise(n = n(), .groups = "drop")
+  
+  cat("\n----------------------------------------\n")
+  cat("Trait:", trait_name, "\n")
+  print(sample_sizes)
+  cat("----------------------------------------\n\n")
+  # --------------------------------------------
+  
+
+  summaries <- df_trait %>%
+    group_by(Temperature) %>%
+    summarise(
+      mean   = mean(value, na.rm = TRUE),
+      median = median(value, na.rm = TRUE),
+      min    = min(value, na.rm = TRUE),
+      max    = max(value, na.rm = TRUE),
+      abs_range = max(value, na.rm = TRUE) - min(value, na.rm = TRUE),
+      rel_range = (max(value, na.rm = TRUE) - min(value, na.rm = TRUE)) / mean(value, na.rm = TRUE)
+    ) %>%
+    mutate(trait = trait_name)
+  
+  mean_list[[trait_name]] <<- summaries
+  
+  kw_test <- kruskal.test(value ~ Temperature, data = df_trait)
+  
+  dunn_res <- dunnTest(value ~ Temperature, data = df_trait, method = "bh")$res
+  
+  pvec <- dunn_res$P.adj
+  comps <- dunn_res$Comparison
+  comps_clean <- gsub(" - ", "-", comps)
+  names(pvec) <- comps_clean
+  
+  letters <- multcompLetters(pvec)$Letters
+  letter_df <- data.frame(
+    Temperature = names(letters),
+    Letters = letters
+  )
+  
+  df_trait$Temperature <- factor(df_trait$Temperature, levels = levels(data_all$Temperature))
+  letter_df$Temperature <- factor(letter_df$Temperature, levels = levels(data_all$Temperature))
+  letter_df$x_pos <- as.numeric(letter_df$Temperature)
+  
+  p <- ggplot(df_trait, aes(x = Temperature, y = value)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(width = 0.2, color = "black", size = 1.5) +
+    geom_text(data = letter_df,
+              aes(x = x_pos, y = max(df_trait$value, na.rm = TRUE) * 1.05, label = Letters),
+              inherit.aes = FALSE, size = 5) +
+    labs(y = trait_labels[trait_name]) +
+    theme_minimal() +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.text.x = element_text(size = 18, face = "bold", angle = 45, hjust = 1),
+      axis.text.y = element_text(size = 18),
+      axis.title.x = element_blank(),
+      axis.title.y = element_text(size = 18, face = "bold"),
+      axis.line.x = element_line(color = "black", size = 0.8),
+      axis.line.y = element_line(color = "black", size = 0.8)
+    )
+  
+  return(p)
+}
+
+plots <- lapply(trait_names, plot_trait)
+
+for (i in seq_along(trait_names)) {
+  ggsave(
+    filename = paste0("FILE PATH", 
+                      trait_names[i], "_plot.svg"),
+    plot = plots[[i]],
+    width = 6, height = 6, units = "in", dpi = 300
+  )
+}
+
+sample_sizes_all <- data_all %>%
+  pivot_longer(cols = all_of(trait_names), names_to = "trait", values_to = "value") %>%
+  filter(!is.na(value)) %>%
+  group_by(trait, Temperature) %>%
+  summarise(n = n(), .groups = "drop")
+
+summary_values <- bind_rows(mean_list) %>%
+  left_join(sample_sizes_all, by = c("trait", "Temperature")) %>%
+  mutate(trait_label = trait_labels[trait]) %>%
+  select(trait_label, Temperature, n, mean, median, min, max, abs_range, rel_range) %>%
+  rename(Trait = trait_label)
+
+format_summary <- summary_values %>%
+  rowwise() %>%
+  mutate(
+    mean = case_when(
+      Trait %in% c("FT (days)", "ESDT (days)", "SS", "SN", "FN") ~ sprintf("%.0f", mean),
+      Trait == "FD [mm]" ~ sprintf("%.2f", mean),
+      Trait == "SSW [mg]" ~ sprintf("%.5f", mean),
+      TRUE ~ as.character(mean)
+    ),
+    median = case_when(
+      Trait %in% c("FT (days)", "ESDT (days)", "SS", "SN", "FN") ~ sprintf("%.0f", median),
+      Trait == "FD [mm]" ~ sprintf("%.2f", median),
+      Trait == "SSW [mg]" ~ sprintf("%.5f", median),
+      TRUE ~ as.character(median)
+    ),
+    min = case_when(
+      Trait %in% c("FT (days)", "ESDT (days)", "SS", "SN", "FN") ~ sprintf("%.0f", min),
+      Trait == "FD [mm]" ~ sprintf("%.2f", min),
+      Trait == "SSW [mg]" ~ sprintf("%.5f", min),
+      TRUE ~ as.character(min)
+    ),
+    max = case_when(
+      Trait %in% c("FT (days)", "ESDT (days)", "SS", "SN", "FN") ~ sprintf("%.0f", max),
+      Trait == "FD [mm]" ~ sprintf("%.2f", max),
+      Trait == "SSW [mg]" ~ sprintf("%.5f", max),
+      TRUE ~ as.character(max)
+    ),
+    abs_range = case_when(
+      Trait %in% c("FT (days)", "ESDT (days)", "SS", "SN", "FN") ~ sprintf("%.0f", abs_range),
+      Trait == "FD [mm]" ~ sprintf("%.2f", abs_range),
+      Trait == "SSW [mg]" ~ sprintf("%.5f", abs_range),
+      TRUE ~ as.character(abs_range)
+    ),
+    rel_range = sprintf("%.2f", rel_range)  # always 2 decimals
+  ) %>%
+  ungroup()
+
+
+write_xlsx(format_summary,
+          "FILE PATH")
+
+summary_values_wide <- summary_values %>%
+  pivot_wider(
+    names_from = Temperature,
+    values_from = c(mean, median, min, max),
+    names_sep = "_"
+  )
+
+write_xlsx(summary_values_wide,
+          "FILE PATH")
+
+fold_changes_consecutive <- summary_values_wide %>%
+  mutate(
+    FC_17_vs_20 = `mean_20°C` / `mean_17°C`,
+    FC_20_vs_24 = `mean_24°C` / `mean_20°C`,
+    FC_24_vs_27 = `mean_27°C` / `mean_24°C`,
+    FC_17_vs_27 = `mean_27°C` / `mean_17°C`
+  ) %>%
+  select(Trait, FC_17_vs_20, FC_20_vs_24, FC_24_vs_27, FC_17_vs_27)
+
+write.csv(fold_changes_consecutive,
+          "FILE PATH",
+          row.names = FALSE)
+
+genetic_variation <- data_all %>%
+  select(all_of(trait_names)) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "Trait",
+    values_to = "Value"
+  ) %>%
+  group_by(Trait) %>%
+  summarise(
+    min_all = min(Value, na.rm = TRUE),
+    max_all = max(Value, na.rm = TRUE),
+    abs_range_all = max_all - min_all,
+    rel_range_all = (max_all - min_all) / mean(Value, na.rm = TRUE)
+  )
+
+
+genetic_variation <- genetic_variation %>%
+  # Ensure Trait is character
+  mutate(Trait = as.character(Trait)) %>%
+  # Replace with pretty names
+  mutate(Trait = trait_labels[Trait]) %>%
+  # Rename numeric columns
+  rename(
+    Min = min_all,
+    Max = max_all,
+    Abs_Range = abs_range_all,
+    Rel_Range = rel_range_all
+  ) %>%
+  # Arrange columns nicely
+  select(Trait, Min, Max, Abs_Range, Rel_Range)
+
+write_xlsx(genetic_variation,
+           "FILE PATH")
+
+combined_plot <- wrap_plots(plots, nrow = 1)
+
+ggsave("FILE PATH",
+       plot = combined_plot,
+       width = 20, height = 5, units = "in", dpi = 300)
+
+
+
+
