@@ -1,0 +1,139 @@
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(broom)
+library(RColorBrewer)
+
+trait_file <- "FILE PATH TRAITS"
+plasticity_file <- "FILE PATH PLASTICITY"
+output_folder <- "FILE PATH"
+if (!dir.exists(output_folder)) dir.create(output_folder, recursive = TRUE)
+
+temp_sheets <- c("Temp17", "Temp20", "Temp24", "Temp27")
+nonfitness_traits <- c("FD", "days_to_bolting", "days_to_10_siliques")
+fitness_traits <- c("single_seed_weight_mg", "Number_of_seeds_Total", "number_of_flowers", "seeds_per_silique")
+plasticity_target <- "Plasticity_17_27"
+
+average_replicates <- function(df, accession_col = "Accession", trait_cols) {
+  df %>%
+    mutate(across(all_of(accession_col), as.character)) %>%
+    group_by(across(all_of(accession_col))) %>%
+    summarise(across(all_of(trait_cols), mean, na.rm = TRUE), .groups = "drop") %>%
+    rename(accession = !!accession_col)
+}
+
+nonfitness_list <- map(temp_sheets, function(sheet) {
+  df <- read_excel(trait_file, sheet = sheet)
+  average_replicates(df, accession_col = "Accession", trait_cols = nonfitness_traits)
+})
+
+nonfitness_all <- bind_rows(nonfitness_list) %>%
+  group_by(accession) %>%
+  summarise(across(all_of(nonfitness_traits), mean, na.rm = TRUE), .groups = "drop")
+
+plasticity_list <- set_names(
+  map(excel_sheets(plasticity_file), ~ read_excel(plasticity_file, sheet = .x)),
+  excel_sheets(plasticity_file)
+)
+
+plasticity_17_27 <- plasticity_list[["Plasticity_17_27"]] %>%
+  dplyr::select(Accession, all_of(fitness_traits)) %>%
+  rename(accession = Accession) %>%
+  mutate(across(all_of(fitness_traits), as.numeric))
+
+df_full <- inner_join(nonfitness_all, plasticity_17_27, by = "accession") %>% drop_na()
+
+results_r2 <- list()
+coef_all <- list() 
+
+for (resp_trait in fitness_traits) {
+  formula <- as.formula(paste(resp_trait, "~", paste(nonfitness_traits, collapse = " + ")))
+  fit <- lm(formula, data = df_full)
+  
+  r2 <- summary(fit)$r.squared
+  
+  r2_df <- tibble(
+    predictor = "All non-fitness traits combined",
+    response = resp_trait,
+    r_squared = r2
+  )
+  
+  results_r2[[resp_trait]] <- r2_df
+  
+  # Coefficients
+  tidy_fit <- tidy(fit) %>%
+    filter(term != "(Intercept)") %>%  # Skip intercept
+    mutate(response = resp_trait)
+  coef_all[[resp_trait]] <- tidy_fit
+}
+
+
+r2_all <- bind_rows(results_r2)
+coef_all <- bind_rows(coef_all) 
+
+colors <- brewer.pal(length(fitness_traits), "Set1")
+
+p <- ggplot(r2_all, aes(x = predictor, y = r_squared, fill = response)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  labs(
+    title = "Overall R² of Combined Non-fitness Predictors/nPredicting Fitness Plasticity (17°C→27°C)",
+    x = "Predictor",
+    y = expression(R^2),
+    fill = "Fitness plasticity response"
+  ) +
+  theme_minimal(base_size = 18) +
+  theme(
+    axis.text.x = element_text(size = 18),
+    axis.text.y = element_text(size = 18),
+    axis.title.x = element_text(margin = margin(t = 10)),
+    axis.title.y = element_text(margin = margin(r = 10)),
+    legend.position = "bottom",
+    legend.title = element_text(size = 18),
+    legend.text = element_text(size = 18),
+    axis.line = element_line(color = "black"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  scale_fill_manual(values = colors) +
+  geom_hline(yintercept = 0.3, color = "red", linetype = "dotted", size = 1)
+
+ggsave(file.path(output_folder, "r2_combined_nonfitness_predict_plasticity_17_27.svg"),
+       plot = p, width = 15, height = 8, dpi = 300)
+
+
+coef_summary <- coef_all %>%
+  group_by(response) %>%
+  summarise(
+    predictor = "All non-fitness traits combined",
+    coefficient = mean(abs(estimate))
+  )
+
+colors_coef <- brewer.pal(length(nonfitness_traits), "Set2")
+
+p_coef <- ggplot(coef_summary, aes(x = predictor, y = coefficient, fill = response)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  labs(
+    title = "Average Absolute Coefficient of Combined Non-fitness Traits/nPredicting Fitness Plasticity (17°C→27°C)",
+    x = "Predictor",
+    y = "Average absolute coefficient",
+    fill = "Fitness plasticity response"
+  ) +
+  theme_minimal(base_size = 18) +
+  theme(
+    axis.text.x = element_text(size = 18, face = "bold"),
+    axis.text.y = element_text(size = 18),
+    axis.title.x = element_text(margin = margin(t = 10)),
+    axis.title.y = element_text(margin = margin(r = 10)),
+    legend.position = "bottom",
+    legend.title = element_text(size = 18),
+    legend.text = element_text(size = 18),
+    axis.line = element_line(color = "black"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  scale_fill_manual(values = colors)
+
+ggsave(file.path(output_folder, "coefficients_combined_nonfitness_predict_plasticity_17_27.svg"),
+       plot = p_coef, width = 15, height = 8, dpi = 300)
