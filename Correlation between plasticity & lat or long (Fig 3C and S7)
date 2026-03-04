@@ -1,0 +1,209 @@
+library(readxl)
+library(tidyverse)
+library(ggpubr)
+library(pheatmap)
+library(openxlsx)
+library(scales)
+
+plasticity_data_file <- "FILE PATH"
+location_file <- "FILE PATH"
+output_folder <- "FILE PATH"
+
+if (!dir.exists(output_folder)) dir.create(output_folder, recursive = TRUE)
+
+loc_data <- read_excel(location_file)
+names(loc_data) <- trimws(names(loc_data))
+
+all_sheets <- excel_sheets(plasticity_data_file)
+
+selected_sheets <- c("Plasticity_17_20", "Plasticity_20_24", "Plasticity_24_27", "Plasticity_17_27")
+
+if (!all(selected_sheets %in% all_sheets)) {
+  stop("One or more selected sheets not found in the Excel file.")
+}
+
+sheet_labels <- c(
+  "Plasticity_17_20" = "17 → 20 °C",
+  "Plasticity_20_24" = "20 → 24 °C",
+  "Plasticity_24_27" = "24 → 27 °C",
+  "Plasticity_17_27" = "17 → 27 °C"
+)
+
+
+trait_names <- c(
+  "days_to_bolting" = "FT (days)",
+  "days_to_10_siliques" = "ESDT (days)",
+  "FD" = "FD [mm]",
+  "seeds_per_silique" = "SS",
+  "single_seed_weight_mg" = "SSW [mg]",
+  "Number_of_seeds_Total" = "SN",
+  "number_of_flowers" = "FN"
+)
+
+perm_spearman_test <- function(x, y, method = "spearman", nperm = 10000) {
+  rho <- cor(x, y, method = method, use = "complete.obs")
+  permuted_rhos <- replicate(nperm, cor(sample(x), y, method = method, use = "complete.obs"))
+  
+  if (rho >= 0) {
+    p_val <- sum(permuted_rhos >= rho) / nperm
+  } else {
+    p_val <- sum(permuted_rhos <= rho) / nperm
+  }
+  
+  return(list(cor = rho, p_val = p_val))
+}
+
+cor_mat <- matrix(NA, nrow = length(trait_names), ncol = length(selected_sheets),
+                  dimnames = list(unname(trait_names), sheet_labels[selected_sheets]))
+pval_mat <- matrix(NA, nrow = length(trait_names), ncol = length(selected_sheets),
+                   dimnames = list(unname(trait_names), sheet_labels[selected_sheets]))
+
+results_list <- list()
+
+for (temp in selected_sheets) {
+  pretty_temp <- sheet_labels[[temp]]
+  safe_temp <- gsub("°", "", pretty_temp)    # remove degree symbol
+  safe_temp <- gsub("–", "-", safe_temp)     # replace en dash with hyphen
+  safe_temp <- gsub("->", "-", safe_temp)    # replace arrow with hyphen
+  safe_temp <- gsub("[^A-Za-z0-9_-]", "_", safe_temp) # replace any other weird chars with underscore
+  cat("\nProcessing temperature:", temp, "\n")
+  
+  raw_data <- read_excel(plasticity_data_file, sheet = temp)
+  
+  if(!("Accession" %in% names(raw_data))) {
+    stop("Column 'Accession' not found in trait data sheet ", temp)
+  }
+  
+  raw_data <- raw_data %>%
+    rename(Name = Accession)
+  
+  merged <- raw_data %>%
+    inner_join(loc_data %>% dplyr::select(Name, Longitude), by = "Name")
+  
+  if(nrow(merged) == 0) {
+    warning(paste("No matching accessions in location data for sheet", temp))
+    next
+  }
+  
+  for (trait in names(trait_names)) {
+    pretty_trait <- trait_names[[trait]] %||% trait
+    
+    # Create folder for each trait if it doesn't exist
+    trait_folder <- file.path(output_folder, pretty_trait)
+    if (!dir.exists(trait_folder)) dir.create(trait_folder)
+    
+    if (!(trait %in% names(merged))) {
+      warning(paste("Trait", trait, "not found in sheet", temp))
+      next
+    }
+    
+    df <- merged %>%
+      dplyr::select(Name, Longitude, all_of(trait)) %>%
+      filter(!is.na(Longitude), !is.na(.data[[trait]]))
+    
+    if(nrow(df) < 3) {
+      warning(paste("Less than 3 data points for", pretty_trait, "at temp", temp))
+      next
+    }
+    
+    cor_res <- perm_spearman_test(df[[trait]], df$Longitude, nperm = 10000)
+    
+    cor_mat[pretty_trait, pretty_temp] <- cor_res$cor
+    pval_mat[pretty_trait, pretty_temp] <- cor_res$p_val
+    
+    results_list[[paste0(pretty_trait, "_", temp)]] <- list(
+      df = df,
+      correlation = cor_res$cor,
+      raw_p = cor_res$p_val,
+      temp = temp,
+      trait = trait,
+      pretty_trait = pretty_trait
+    )
+  }
+}
+
+all_pvals <- as.vector(pval_mat)
+valid_pvals <- all_pvals[!is.na(all_pvals)]
+adjusted_pvals <- p.adjust(valid_pvals, method = "BH")
+
+pval_mat_fdr <- matrix(NA, nrow = nrow(pval_mat), ncol = ncol(pval_mat),
+                       dimnames = dimnames(pval_mat))
+pval_mat_fdr[!is.na(pval_mat)] <- adjusted_pvals
+
+sig_stars_fdr <- matrix("", nrow = nrow(pval_mat), ncol = ncol(pval_mat),
+                        dimnames = dimnames(pval_mat))
+sig_stars_fdr[pval_mat_fdr < 0.05] <- "*"
+sig_stars_fdr[pval_mat_fdr < 0.01] <- "**"
+sig_stars_fdr[pval_mat_fdr < 0.001] <- "***"
+
+for (res_name in names(results_list)) {
+  res <- results_list[[res_name]]
+  pretty_trait <- res$pretty_trait
+  temp <- res$temp
+  trait <- res$trait
+  df <- res$df
+  
+  adj_p <- pval_mat_fdr[pretty_trait, pretty_temp]
+  
+  p <- ggscatter(
+    df, x = "Longitude", y = trait,
+    add = "reg.line", conf.int = TRUE,
+    xlab = "Longitude (°)", ylab = "Trait value"
+  ) +
+    labs(
+      title = paste0(pretty_trait, " (", pretty_temp, ")\n",
+                     "rho = ", round(res$cor, 3),
+                     ", adj p = ", signif(adj_p, 3))
+    ) +
+    theme(
+      plot.title = element_text(size = 18, face = "bold"),
+      axis.title = element_text(size = 18, face = "bold"),
+      axis.text = element_text(size = 18, face = "bold")
+    )
+  
+  trait_folder <- file.path(output_folder, pretty_trait)
+  plot_file <- file.path(trait_folder, paste0(pretty_trait, "_", gsub("°", "", safe_temp), "_Longitude.svg"))
+  ggsave(plot_file, p, width = 4, height = 3)
+}
+
+cor_df <- as.data.frame(as.table(cor_mat))
+names(cor_df) <- c("Trait", "Temperature", "Correlation")
+
+sig_df <- as.data.frame(as.table(sig_stars_fdr))
+names(sig_df) <- c("Trait", "Temperature", "Signif")
+
+plot_df <- left_join(cor_df, sig_df, by = c("Trait", "Temperature"))
+
+plot_df$Label <- ifelse(
+  plot_df$Signif != "",
+  sprintf("%.2f\n%s", plot_df$Correlation, plot_df$Signif),  # Correlation, then newline, then stars
+  ""
+)
+
+p <- ggplot(plot_df, aes(x = Temperature, y = Trait, fill = Correlation)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = muted("blue"), mid = "white", high = muted("red"), midpoint = 0,
+                       limits = c(-1, 1)) +
+  geom_text(aes(label = Label), color = "black", size = 6) +
+  theme_minimal(base_size = 18) +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  ) +
+  labs(fill = NULL)
+
+ggsave(filename = file.path(output_folder, "Heatmap_Plasticity_Longitude_Correlations_Permutation_FDR.svg"),
+       plot = p, width = 7, height = 6)
+
+excel_df <- cor_df %>%
+  rename(Correlation = Correlation) %>%
+  mutate(
+    Raw_p_value = mapply(function(tr, temp) pval_mat[tr, temp], Trait, Temperature),
+    Adjusted_p_value = mapply(function(tr, temp) pval_mat_fdr[tr, temp], Trait, Temperature)
+  )
+
+write.xlsx(excel_df,
+           file = file.path(output_folder, "Plasticity_Longitude_Correlation_Results.xlsx"),
+           overwrite = TRUE)
