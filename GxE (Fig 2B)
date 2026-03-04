@@ -1,0 +1,117 @@
+library(dplyr)
+library(tidyr)
+library(readxl)
+library(ggplot2)
+library(lme4)
+library(writexl)
+
+file_path <- "FILE PATH"
+sheet_names <- c("Temp17", "Temp20", "Temp24", "Temp27")
+
+data_list <- lapply(sheet_names, function(sheet) {
+  read_excel(file_path, sheet = sheet) %>%
+    mutate(Temperature = sheet)
+})
+data_combined <- bind_rows(data_list)
+
+data_combined_clean <- data_combined %>%
+  filter(!is.na(Accession) & !is.na(Temperature))
+
+traits <- c("days_to_bolting", 
+            "days_to_10_siliques", 
+            "FD",
+            "seeds_per_silique",
+            "single_seed_weight_mg",
+            "Number_of_seeds_Total",
+            "number_of_flowers")
+
+variance_components_list <- lapply(traits, function(trait) {
+  
+  
+  lmm_model <- lmer(as.formula(paste(trait, "~ + (1|Accession) + (1|Temperature) + (1|Accession:Temperature)")),
+                                 data = data_combined_clean, REML = TRUE)
+  
+
+  
+  var_comp <- as.data.frame(VarCorr(lmm_model))
+  
+  G <- var_comp[var_comp$grp == "Accession", "vcov"]         
+  E <- var_comp[var_comp$grp == "Temperature", "vcov"]       
+  GxE <- var_comp[var_comp$grp == "Accession:Temperature", "vcov"]  
+  Residual <- attr(VarCorr(lmm_model), "sc")^2               
+  
+  
+  total_variation <- G + E + GxE + Residual
+  
+  
+  variance_components <- data.frame(
+    Trait = rep(trait, 4),
+    Component = c("Genotype (G)", "Environment (E)", "Genotype × Environment (GxE)", "Residual (R)"),
+    Variance = c(G, E, GxE, Residual),
+    Proportion = c(G / total_variation, E / total_variation, GxE / total_variation, Residual / total_variation)
+  )
+   
+  return(variance_components)
+})
+
+variance_components_all_traits <- bind_rows(variance_components_list)
+
+head(variance_components_all_traits)
+
+trait_labels <- c(
+  days_to_bolting = "FT (days)",
+  days_to_10_siliques = "ESDT (days)",
+  FD = "FD [mm]",
+  seeds_per_silique = "SS",
+  single_seed_weight_mg = "SSW [mm]",
+  Number_of_seeds_Total = "SN",
+  number_of_flowers = "FN"
+)
+
+component_labels <- c(
+  "Genotype (G)" = "G",
+  "Environment (E)" = "E",
+  "Genotype × Environment (GxE)" = "GxE",
+  "Residual (R)" = "R"
+)
+
+variance_components_all_traits <- variance_components_all_traits %>%
+  mutate(Component = recode(Component, !!!component_labels))
+
+
+variance_components_all_traits <- variance_components_all_traits %>%
+  mutate(
+    Trait = recode(Trait, !!!trait_labels),
+    Trait = factor(Trait, levels = trait_labels)  # This sets the order in the plot
+  )
+
+variance_colors_muted <- c(
+  "G"   = "#9370DB", 
+  "E"   = "#66C2A5",  
+  "GxE" = "#F4A261", 
+  "R"   = "#BFBFBF"   
+)
+
+p <- ggplot(variance_components_all_traits, aes(x = Trait, y = Proportion, fill = Component)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(title = "", y = "Proportion of Total Variation", x = "Trait") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 18),
+    axis.text.y = element_text(size = 18),
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_text(size = 18),
+    plot.title = element_text(size = 18, hjust = 0.5),  
+    legend.title = element_text(size = 18),
+    legend.text = element_text(size = 18),
+    panel.grid.major = element_blank(),   
+    panel.grid.minor = element_blank()    
+  ) +
+  scale_fill_manual(values = variance_colors_muted)
+
+
+ggsave("FILE PATH", plot = p, width = 6, height = 6)
+
+write_xlsx(variance_components_all_traits,
+           path = "FILE PATH")
+
