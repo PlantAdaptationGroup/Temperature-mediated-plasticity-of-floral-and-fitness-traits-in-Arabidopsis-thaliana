@@ -1,0 +1,84 @@
+# Load required packages
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(openxlsx)
+
+input_file <- "FILE PATH"
+output_dir <- "FILE PATH"
+
+if(!dir.exists(output_dir)) dir.create(output_dir)
+
+sheets <- c("Temp17", "Temp20", "Temp24", "Temp27")
+temp_labels <- c("17°C", "20°C", "24°C", "27°C")
+names(temp_labels) <- sheets
+
+trait_names <- c("days_to_bolting", "days_to_10_siliques", "FD",
+                 "seeds_per_silique", "single_seed_weight_mg",
+                 "Number_of_seeds_Total", "number_of_flowers")
+trait_labels <- c("FT (days)", "ESDT (days)", "FD [mm]", "SS", "SSW [mg]", "SN", "FN")
+names(trait_labels) <- trait_names
+
+cv_fun <- function(x) {
+  100 * sd(x, na.rm = TRUE) / mean(x, na.rm = TRUE)
+}
+
+cv_list <- list()
+
+for(sheet in sheets){
+  data <- read_excel(input_file, sheet = sheet)
+  
+  if(!"Accession" %in% colnames(data)) stop("Column 'Accession' not found in sheet ", sheet)
+
+  acc_means <- data %>%
+    group_by(Accession) %>%
+    summarise(across(all_of(trait_names), ~ mean(.x, na.rm = TRUE)))
+
+  cv_df <- acc_means %>%
+    summarise(across(all_of(trait_names), cv_fun, .names = "CV_{.col}")) %>%
+    pivot_longer(cols = everything(),
+                 names_to = "Trait",
+                 values_to = "CV") %>%
+    mutate(Temperature = sheet,
+           Trait = sub("CV_", "", Trait))
+  
+  cv_list[[sheet]] <- cv_df
+}
+
+cv_all <- bind_rows(cv_list)
+
+cv_all$Trait_Label <- trait_labels[cv_all$Trait]
+
+cv_all$Temperature <- temp_labels[cv_all$Temperature]
+
+output_excel <- file.path(output_dir, "Overall_CVs_from_accession_means.xlsx")
+write.xlsx(cv_all, output_excel, overwrite = TRUE)
+
+y_min <- 0
+y_max <- ceiling(max(cv_all$CV, na.rm = TRUE))  # round up to nearest integer
+
+for(trait in trait_names){
+  plot_data <- cv_all %>% filter(Trait == trait)
+  
+  p <- ggplot(plot_data, aes(x = Temperature, y = CV, group = 1)) +
+    geom_line(size = 2, color = "black") +
+    geom_point(size = 4, color = "black") +
+    theme_bw(base_size = 22) +
+    labs(title = paste("CV for", trait_labels[trait]),
+         x = "Temperature",
+         y = "Coefficient of Variation (%)") +
+    coord_cartesian(ylim = c(y_min, y_max)) +   # fixed scale for all
+    theme(
+      legend.position = "none",
+      axis.text.x = element_text(size = 22),
+      axis.text.y = element_text(size = 22),
+      axis.title = element_text(size = 24),
+      plot.title = element_text(size = 26, face = "bold"),
+      panel.grid = element_blank()
+    )
+  
+  ggsave(filename = file.path(output_dir, paste0("CV_", trait, "_line.svg")),
+         plot = p, width = 8, height = 6)
+}
+
