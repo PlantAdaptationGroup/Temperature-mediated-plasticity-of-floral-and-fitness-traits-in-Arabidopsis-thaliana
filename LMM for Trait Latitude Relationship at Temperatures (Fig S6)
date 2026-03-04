@@ -1,0 +1,203 @@
+library(readxl)
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(ggpubr)
+library(openxlsx)
+library(scales)
+library(MuMIn)
+library(emmeans)
+library(gridExtra)
+library(grid) 
+library(cowplot)
+library(patchwork)
+
+# ---- USER INPUT ----
+trait_data_file <- "FILE PATH TRAITS"
+location_file <- "FILE PATH LOCATION DATA OF ACCESSIONS"
+output_folder <- "FILE PATH"
+
+if (!dir.exists(output_folder)) dir.create(output_folder, recursive = TRUE)
+
+loc_data <- read_excel(location_file) %>% rename(Name = "Name")
+temp_sheets <- excel_sheets(trait_data_file)
+
+trait_names <- c(
+  "days_to_bolting" = "FT (days)",
+  "days_to_10_siliques" = "ESDT (days)",
+  "FD" = "FD [mm]",
+  "seeds_per_silique" = "SS",
+  "single_seed_weight_mg" = "SSW [mg]",
+  "Number_of_seeds_Total" = "SN",
+  "number_of_flowers" = "FN"
+)
+
+long_data <- lapply(temp_sheets, function(temp) {
+  df <- read_excel(trait_data_file, sheet = temp) %>%
+    rename(Name = Accession) %>%
+    inner_join(loc_data %>% select(Name, Latitude), by = "Name") %>%
+    mutate(Temperature = temp)
+  return(df)
+}) %>% bind_rows()
+
+long_data$Temperature <- factor(long_data$Temperature, levels = temp_sheets)
+
+results_lmm <- list()
+pairwise_results_list <- list()
+
+for (trait in names(trait_names)) {
+  if (!(trait %in% names(long_data))) next
+  
+  df <- long_data %>%
+    filter(!is.na(.data[[trait]]), !is.na(Latitude))
+  
+  if(nrow(df) < 5) next  
+  
+  model <- lmer(as.formula(paste(trait, "~ Latitude * Temperature + (1|Name)")), data = df)
+  summary_model <- summary(model)
+  
+  R2_vals <- MuMIn::r.squaredGLMM(model)
+  
+  anova_res <- anova(model)
+  int_p <- anova_res["Latitude:Temperature", "Pr(>F)"]
+  
+  results_lmm[[trait]] <- list(
+    model = model,
+    summary = summary_model,
+    coef = summary_model$coefficients
+  )
+  
+  r2_df <- df %>%
+    group_by(Temperature) %>%
+    do({
+      m <- lm(as.formula(paste(trait,"~ Latitude")), data = .)
+      r2 <- summary(m)$r.squared
+      pval <- summary(m)$coefficients["Latitude","Pr(>|t|)"]
+      stars <- ifelse(pval < 0.001, "***",
+                      ifelse(pval < 0.01, "**",
+                             ifelse(pval < 0.05, "*", "ns")))
+      tibble(R2label = paste0("R²=", round(r2,2), " ", stars))
+    }) %>%
+    ungroup()
+  
+  max_y <- max(df[[trait]], na.rm=TRUE)
+  max_x <- max(df$Latitude, na.rm=TRUE)
+  r2_df <- r2_df %>%
+    mutate(
+      Latitude = max_x, 
+      y_pos = seq(from = max_y * 1.05, by = -max_y*0.07, length.out = n())
+    )
+  
+  slopes <- emtrends(model, ~ Temperature, var="Latitude")
+  pairs_slopes <- pairs(slopes)
+  
+  pairs_df <- as.data.frame(pairs_slopes) %>%
+    mutate(
+      Trait = trait_names[[trait]],
+      # format contrast labels: "Temperature17 - Temperature20" → "17 <-> 20"
+      contrast = gsub("Temperature", "", contrast),
+      contrast = gsub(" - ", " ↔ ", contrast),
+      pval = format.pval(p.value, digits = 2, eps = 0.001)
+    ) %>%
+    select(Trait, contrast, estimate, SE, df, t.ratio, pval)
+  
+  pairwise_results_list[[trait]] <- pairs_df
+  
+  pairwise_table <- tableGrob(
+    pairs_df %>% select(contrast, pval),
+    rows = NULL,
+    theme = ttheme_minimal(base_size = 12)
+  )
+  
+  base_size <- 20
+  
+  p <- ggplot(df, aes(x = Latitude, y = .data[[trait]], color = Temperature)) +
+    geom_point(size = 6, alpha = 0.7) +
+    geom_smooth(method = "lm", se = TRUE, linewidth = 2) +
+    scale_color_manual(values = scales::viridis_pal(option = "D")(length(temp_sheets))) +
+    labs(
+      x = "Latitude (°)",
+      y = trait_names[[trait]],
+      color = "Temperature",
+      title = paste0(
+        trait_names[[trait]], " \n",
+        "R²m=", round(R2_vals[1], 2),
+        " | R²c=", round(R2_vals[2], 2),
+        " | Lat×Temp p=", signif(int_p, 3)
+      )
+    ) +
+    theme_minimal(base_size = base_size) +  # base size applies to axis text, labels, legend
+    theme(
+      plot.title = element_text(size = base_size, face = "bold"),  # title same as everything
+      axis.title = element_text(size = base_size, face = "bold"),
+      axis.text = element_text(size = base_size),
+      legend.title = element_text(size = base_size),
+      legend.text = element_text(size = base_size),
+      legend.position = "none",
+      axis.line = element_line(color = "black", size = 1),
+      panel.grid = element_blank()
+    ) +
+    geom_text(
+      data = r2_df,
+      aes(x = max(df$Latitude), y = y_pos, label = R2label, color = Temperature),
+      inherit.aes = FALSE,
+      hjust = 1, size = base_size*0.35,  # geom_text size is in mm ~0.35*base_size
+      fontface = "bold",
+      show.legend = FALSE
+    )
+  
+  legend_grob <- cowplot::get_legend(
+    p + theme(legend.position = "right")
+  )
+  
+  desired_contrasts <- c("17 ↔ 20", "20 ↔ 24", "24 ↔ 27", "17 ↔ 27")
+  pairs_df_filtered <- pairs_df %>%
+    filter(contrast %in% desired_contrasts)
+  
+  pairwise_table <- tableGrob(
+    pairs_df_filtered %>% select(contrast, pval),
+    rows = NULL,
+    theme = ttheme_minimal(
+      base_size = base_size,
+      core = list(fg_params = list(cex = 1)),  # keep consistent
+      colhead = list(fg_params = list(cex = 1, fontface = "bold"))
+    )
+  )
+  
+  side_panel <- cowplot::plot_grid(
+    legend_grob, pairwise_table,
+    ncol = 1,
+    rel_heights = c(1, 1.2)
+  )
+  
+  final_plot <- cowplot::plot_grid(
+    p, side_panel,
+    ncol = 2,
+    rel_widths = c(3, 1)
+  )
+  
+  plot_file <- file.path(output_folder, paste0(trait, "_LMM_plot_withStats.svg"))
+  ggsave(plot_file, final_plot, width = 9, height = 6)
+  print(final_plot)
+  
+}
+
+lmm_results_df <- do.call(rbind, lapply(names(results_lmm), function(trait) {
+  coef_df <- as.data.frame(results_lmm[[trait]]$coef)
+  coef_df$Term <- rownames(coef_df)
+  coef_df$Trait <- trait_names[[trait]]
+  rownames(coef_df) <- NULL
+  coef_df
+}))
+lmm_results_df <- lmm_results_df %>% select(Trait, Term, everything())
+
+pairwise_results_df <- bind_rows(pairwise_results_list)
+
+write.xlsx(
+  list(
+    "LMM_Coefficients" = lmm_results_df,
+    "Slope_Comparisons" = pairwise_results_df
+  ),
+  file.path(output_folder, "Trait_Latitude_LMM_Results.xlsx"),
+  overwrite = TRUE
+)
